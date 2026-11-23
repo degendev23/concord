@@ -71,6 +71,14 @@ describe("databases written by earlier builds", () => {
     });
   });
 
+  it("opens the v6 workspace database and reads the action history table and view", () => {
+    upgraded("org-v6.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v6");
+      expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM action_history")?.n).toBe(1);
+      expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM action_changes")?.n).toBe(1);
+    });
+  });
+
   it("backfills sign-off history from the v1 notes when upgrading", () => {
     upgraded("org-v1.db", ORG_MIGRATIONS, (db) => {
       expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM break_note_history")?.n).toBe(0);
