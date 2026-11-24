@@ -12,6 +12,7 @@ import {
   reconcilePositions,
   redemptionDeltas,
   replay,
+  splitCashInLieu,
   splitDeltas,
   toCsv,
   type AssetEvent,
@@ -118,6 +119,12 @@ export interface ActionInput {
   /** Split ratio or redemption fraction. */
   num?: string;
   den?: string;
+  /** Split: optional cash in lieu of fractional units. */
+  cashInLieu?: {
+    asset: string;
+    pricePerUnit: string;
+    payer?: string;
+  };
 }
 
 export interface NoteInput {
@@ -161,6 +168,15 @@ interface RunResult {
   breaks: StoredBreak[];
 }
 
+interface ActionFlowResult {
+  reconciledThrough: string | null;
+  status: "clean" | "breaks";
+  flowAsset: { id: string; code: string };
+  summary: Record<string, string | number>;
+  lines: Array<Record<string, unknown>>;
+  breaks: StoredBreak[];
+}
+
 interface ActionResult {
   reconciledThrough: string | null;
   warnings: string[];
@@ -169,6 +185,7 @@ interface ActionResult {
   summary: Record<string, string | number>;
   lines: Array<Record<string, unknown>>;
   breaks: StoredBreak[];
+  cashInLieu?: ActionFlowResult;
 }
 
 const now = () => new Date().toISOString();
@@ -1429,8 +1446,25 @@ export class Concord {
       }
       params.num = input.num;
       params.den = input.den;
+      if (input.type === "split" && input.cashInLieu) {
+        if (!input.cashInLieu.asset) throw new Invalid("cashInLieu needs asset");
+        const cash = this.asset(String(input.cashInLieu.asset));
+        if (cash.network !== asset.network) throw new Invalid("the cash in lieu asset must be on the same network");
+        if (!input.cashInLieu.pricePerUnit || !/^\d+(\.\d+)?$/.test(input.cashInLieu.pricePerUnit)) {
+          throw new Invalid("cashInLieu needs pricePerUnit as a decimal");
+        }
+        const cilPayer = address(input.cashInLieu.payer ?? input.payer, "payer");
+        params.cashInLieu = {
+          asset: cash.id,
+          pricePerUnit: input.cashInLieu.pricePerUnit,
+          ...(cilPayer ? { payer: cilPayer } : {}),
+        };
+      }
     } else {
       throw new Invalid("type must be dividend, split or redemption");
+    }
+    if (input.cashInLieu && input.type !== "split") {
+      throw new Invalid("cashInLieu is only valid for split actions");
     }
     const title =
       label(input.label, "label") ??
@@ -1489,7 +1523,7 @@ export class Concord {
   async reconcileAction(id: number, options: { sync?: boolean } = {}) {
     const row = this.db.get("SELECT * FROM actions WHERE id = ?", id);
     if (!row) throw new NotFound(`corporate action ${id} not found`);
-    const params = JSON.parse(String(row.params)) as Record<string, string | string[] | undefined>;
+    const params = JSON.parse(String(row.params)) as Record<string, unknown>;
     const type = String(row.type) as ActionType;
     const warnings: string[] = [];
     const refresh = options.sync !== false;
@@ -1500,6 +1534,15 @@ export class Concord {
       await this.trySync(flowAsset, warnings);
       // The sync moved the pay asset's read-through time; the record read above is stale.
       flowAsset = this.asset(flowAsset.id);
+    }
+    const cilParams =
+      type === "split" && params.cashInLieu
+        ? (params.cashInLieu as { asset: string; pricePerUnit: string; payer?: string })
+        : undefined;
+    let cashAsset = cilParams ? this.asset(cilParams.asset) : undefined;
+    if (refresh && cashAsset && cashAsset.id !== asset.id && cashAsset.id !== flowAsset.id) {
+      await this.trySync(cashAsset, warnings);
+      cashAsset = this.asset(cashAsset.id);
     }
 
     const recordTime = String(row.record_time);
@@ -1528,6 +1571,7 @@ export class Concord {
     let expected: ExpectedFlows;
     let plus: EventKind[];
     let minus: EventKind[] = [];
+    let splitFractions: Map<string, bigint> | undefined;
     const payer = params.payer as string | undefined;
     if (type === "dividend") {
       expected = dividendEntitlements(snapshot, {
@@ -1542,7 +1586,9 @@ export class Concord {
     } else {
       const ratio = { num: BigInt(String(params.num)), den: BigInt(String(params.den)) };
       if (type === "split") {
-        expected = splitDeltas(snapshot, ratio, exclude).deltas;
+        const splitRes = splitDeltas(snapshot, ratio, exclude);
+        expected = splitRes.deltas;
+        splitFractions = splitRes.fractions;
         plus = ["mint"];
         // Reverse splits can retire units via burn as well as issuer clawback.
         minus = ["burn", "clawback"];
@@ -1569,12 +1615,91 @@ export class Concord {
     }
     const ignore = [...exclude, ...(payer ? [payer] : [])];
     const recon = reconcileDistribution(snapshot, expected, observed, { ignore });
+
+    let cashFlowResult: ActionFlowResult | undefined;
+    if (type === "split" && cilParams && cashAsset && splitFractions) {
+      const ratio = { num: BigInt(String(params.num)), den: BigInt(String(params.den)) };
+      const cashExpected = splitCashInLieu(splitFractions, ratio.den, {
+        pricePerUnit: String(cilParams.pricePerUnit),
+        baseDecimals: asset.decimals,
+        payDecimals: cashAsset.decimals,
+        rounding: (params.rounding as Rounding | undefined) ?? "floor",
+      });
+      const cashPayer = cilParams.payer ?? payer;
+      const cashPlus: EventKind[] = cashPayer && cashPayer !== cashAsset.issuer ? ["transfer"] : ["mint"];
+      const cashObserved = observeFlows(this.loadEvents(cashAsset.id), {
+        afterTime: recordTime,
+        plus: cashPlus,
+        minus: [],
+        ...(windowTo ? { untilTime: windowTo } : {}),
+        ...(windowFromLedger !== undefined ? { fromLedger: windowFromLedger } : {}),
+        ...(windowToLedger !== undefined ? { toLedger: windowToLedger } : {}),
+        ...(cashPayer ? { payer: cashPayer } : {}),
+      });
+      if (cashPayer && cashObserved.size === 0) {
+        warnings.push(`Payer ${cashPayer} has no recorded flows in the action window for cash in lieu`);
+      }
+      const cashIgnore = [...exclude, ...(cashPayer ? [cashPayer] : [])];
+      const cashRecon = reconcileDistribution(snapshot, cashExpected, cashObserved, { ignore: cashIgnore });
+      const cflow = (v: bigint) => formatUnits(v, cashAsset.decimals);
+      cashFlowResult = {
+        reconciledThrough: cashAsset.syncedAt ?? null,
+        status: cashRecon.breaks.length === 0 ? "clean" : "breaks",
+        flowAsset: { id: cashAsset.id, code: cashAsset.code },
+        summary: {
+          holders: cashRecon.summary.holders,
+          expectedTotal: cflow(cashRecon.summary.expectedTotal),
+          observedTotal: cflow(cashRecon.summary.observedTotal),
+          difference: cflow(cashRecon.summary.difference),
+          breakCount: cashRecon.summary.breakCount,
+        },
+        lines: cashRecon.lines.map((l) => ({
+          address: l.address,
+          basis: base(l.basis),
+          expected: cflow(l.expected),
+          observed: cflow(l.observed),
+          difference: cflow(l.difference),
+          txHashes: l.txHashes,
+          status: l.status,
+        })),
+        breaks: cashRecon.breaks.map((b): StoredBreak => ({
+          scope: "distribution",
+          type: b.type,
+          severity: b.severity,
+          key: `cash:${b.key}`,
+          fingerprint: `${b.expected}|${b.observed}`,
+          message: `${b.message} (cash in lieu)`,
+          address: b.address,
+          expected: cflow(b.expected),
+          observed: cflow(b.observed),
+          difference: cflow(b.difference),
+        })),
+      };
+    }
+
     const base = (v: bigint) => formatUnits(v, asset.decimals);
     const flow = (v: bigint) => formatUnits(v, flowAsset.decimals);
+
+    const unitBreaks = recon.breaks.map((b): StoredBreak => ({
+      scope: "distribution",
+      type: b.type,
+      severity: b.severity,
+      key: b.key,
+      fingerprint: `${b.expected}|${b.observed}`,
+      message: b.message,
+      address: b.address,
+      expected: flow(b.expected),
+      observed: flow(b.observed),
+      difference: flow(b.difference),
+    }));
+
+    const allBreaks = cashFlowResult ? [...unitBreaks, ...cashFlowResult.breaks] : unitBreaks;
+    const isClean = recon.breaks.length === 0 && (!cashFlowResult || cashFlowResult.breaks.length === 0);
+
     const result: ActionResult = {
       reconciledThrough: flowAsset.syncedAt ?? null,
       warnings,
-      status: recon.breaks.length === 0 ? "clean" : "breaks",
+      status: isClean ? "clean" : "breaks",
       flowAsset: { id: flowAsset.id, code: flowAsset.code },
       summary: {
         holders: recon.summary.holders,
@@ -1592,18 +1717,8 @@ export class Concord {
         txHashes: l.txHashes,
         status: l.status,
       })),
-      breaks: recon.breaks.map((b): StoredBreak => ({
-        scope: "distribution",
-        type: b.type,
-        severity: b.severity,
-        key: b.key,
-        fingerprint: `${b.expected}|${b.observed}`,
-        message: b.message,
-        address: b.address,
-        expected: flow(b.expected),
-        observed: flow(b.observed),
-        difference: flow(b.difference),
-      })),
+      breaks: allBreaks,
+      ...(cashFlowResult ? { cashInLieu: cashFlowResult } : {}),
     };
     this.db.write("UPDATE actions SET result = ?, reconciled_at = ? WHERE id = ?", JSON.stringify(result), now(), id);
     return this.action(id);
@@ -1674,8 +1789,22 @@ export class Concord {
         "SELECT synced_at FROM assets WHERE id = ?",
         result.flowAsset.id,
       );
-      if (!flow?.synced_at) continue;
-      if (result.reconciledThrough === null || flow.synced_at > result.reconciledThrough) due.push(row.id);
+      if (flow?.synced_at && (result.reconciledThrough === null || flow.synced_at > result.reconciledThrough)) {
+        due.push(row.id);
+        continue;
+      }
+      if (result.cashInLieu?.flowAsset?.id) {
+        const cashFlow = this.db.get<{ synced_at: string | null }>(
+          "SELECT synced_at FROM assets WHERE id = ?",
+          result.cashInLieu.flowAsset.id,
+        );
+        if (
+          cashFlow?.synced_at &&
+          (result.cashInLieu.reconciledThrough === null || cashFlow.synced_at > result.cashInLieu.reconciledThrough)
+        ) {
+          due.push(row.id);
+        }
+      }
     }
     let done = 0;
     for (const id of due) {
@@ -1867,7 +1996,22 @@ export class Concord {
       })(),
       registers,
       reconciliations: runs,
-      corporateActions: this.actions(asset.id).filter((a) => inPeriod(a.recordTime)),
+      corporateActions: this.actions(asset.id)
+        .filter((a) => inPeriod(a.recordTime))
+        .map(({ result, ...rest }) => ({
+          ...rest,
+          result: result
+            ? {
+                reconciledThrough: result.reconciledThrough,
+                warnings: result.warnings,
+                status: result.status,
+                flowAsset: result.flowAsset,
+                summary: result.summary,
+                lines: result.lines,
+                breaks: result.breaks,
+              }
+            : null,
+        })),
       controls,
       // The whole trail, not the period: sign-offs happen in wall-clock time, not chain time.
       signoffHistory: this.noteHistory(asset.id),
