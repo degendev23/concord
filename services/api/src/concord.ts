@@ -1881,6 +1881,7 @@ export class Concord {
   /** One section of the audit pack as CSV. */
   exportCsv(ref: string, section: string, period: { from?: string; to?: string } = {}): string {
     const pack = this.auditExport(ref, period);
+    const asset = this.asset(ref);
     switch (section) {
       case "holdings":
         return toCsv(["address", "units", "share", "status", "ignored"], pack.holdings.holders);
@@ -1929,8 +1930,127 @@ export class Concord {
           rows,
         );
       }
+      case "positions": {
+        const rows: Array<Record<string, unknown>> = [];
+        for (const run of pack.reconciliations) {
+          for (const l of run.lines) {
+            rows.push({
+              runId: run.id,
+              asOf: run.asOf,
+              address: l.address,
+              holderIds: Array.isArray(l.holderIds) ? l.holderIds.join(";") : "",
+              chainUnits: l.chainUnits,
+              registerUnits: l.registerUnits,
+              difference: l.difference,
+              chainStatus: l.chainStatus ?? "",
+              registerStatus: l.registerStatus ?? "",
+              matched: l.matched,
+            });
+          }
+        }
+        return toCsv(
+          [
+            "runId",
+            "asOf",
+            "address",
+            "holderIds",
+            "chainUnits",
+            "registerUnits",
+            "difference",
+            "chainStatus",
+            "registerStatus",
+            "matched",
+          ],
+          rows,
+        );
+      }
+      case "runs": {
+        const rows = pack.reconciliations.map((r) => ({
+          id: r.id,
+          asOf: r.asOf,
+          createdAt: r.createdAt,
+          registerId: r.registerId,
+          status: r.status,
+          chainLedger: r.chainLedger,
+          chainSyncedAt: r.chainSyncedAt ?? "",
+          chainBehind: r.chainBehind,
+          chainSupply: r.summary.chainSupply,
+          registerTotal: r.summary.registerTotal,
+          supplyDifference: r.summary.supplyDifference,
+          chainHolders: r.summary.chainHolders,
+          registerHolders: r.summary.registerHolders,
+          lines: r.summary.lines,
+          matchedLines: r.summary.matchedLines,
+          breakCount: r.summary.breakCount,
+          openBreaks: r.openBreaks,
+        }));
+        return toCsv(
+          [
+            "id",
+            "asOf",
+            "createdAt",
+            "registerId",
+            "status",
+            "chainLedger",
+            "chainSyncedAt",
+            "chainBehind",
+            "chainSupply",
+            "registerTotal",
+            "supplyDifference",
+            "chainHolders",
+            "registerHolders",
+            "lines",
+            "matchedLines",
+            "breakCount",
+            "openBreaks",
+          ],
+          rows,
+        );
+      }
+      case "actions": {
+        const rows = pack.corporateActions.map((a) => ({
+          id: a.id,
+          type: a.type,
+          label: a.label,
+          recordTime: a.recordTime,
+          state: a.state,
+          createdAt: a.createdAt,
+          reconciledAt: a.reconciledAt ?? "",
+          openBreaks: a.openBreaks,
+        }));
+        return toCsv(
+          ["id", "type", "label", "recordTime", "state", "createdAt", "reconciledAt", "openBreaks"],
+          rows,
+        );
+      }
+      case "journal": {
+        const entries = this.db.all("SELECT * FROM journal WHERE asset_id = ? ORDER BY date, ref", asset.id);
+        const rows = entries.map((r) => ({
+          ref: String(r.ref),
+          date: String(r.date),
+          type: String(r.type),
+          from_account: r.from_addr ? String(r.from_addr) : "",
+          to_account: r.to_addr ? String(r.to_addr) : "",
+          units: formatUnits(BigInt(String(r.units)), asset.decimals),
+          tx_hash: r.tx_hash ? String(r.tx_hash) : "",
+        }));
+        return toCsv(["ref", "date", "type", "from_account", "to_account", "units", "tx_hash"], rows);
+      }
+      case "instructions": {
+        const list = this.db.all("SELECT * FROM instructions WHERE asset_id = ? ORDER BY issued_at, ref", asset.id);
+        const rows = list.map((r) => ({
+          ref: String(r.ref),
+          type: String(r.type),
+          account: String(r.account),
+          units: r.units ? formatUnits(BigInt(String(r.units)), asset.decimals) : "",
+          issued_at: String(r.issued_at),
+          approved_by: r.approved_by ? String(r.approved_by) : "",
+          reason: r.reason ? String(r.reason) : "",
+        }));
+        return toCsv(["ref", "type", "account", "units", "issued_at", "approved_by", "reason"], rows);
+      }
       default:
-        throw new Invalid("section must be holdings, events, controls or breaks");
+        throw new Invalid("section must be holdings, events, controls, breaks, positions, runs, actions, journal or instructions");
     }
   }
 }

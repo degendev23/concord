@@ -980,6 +980,99 @@ describe("Concord", () => {
     `);
   });
 
+  describe("exportCsv additional sections", () => {
+    beforeEach(async () => {
+      await concord.sync("FUND");
+      concord.importJournal(
+        "FUND",
+        `ref,date,type,from_account,to_account,units,tx_hash\nJ1,${at(3)},issue,,${h1},100,tx1\n`,
+      );
+      concord.importInstructions(
+        "FUND",
+        `ref,type,account,units,issued_at,approved_by,reason\nI1,authorise,${h1},,${at(1)},ops,KYC\n`,
+      );
+      const reg = concord.importRegister("FUND", {
+        csv: `holder_id,account,units,status\nA,${h1},90,active\n`,
+        asOf: at(5),
+      });
+      await concord.reconcile("FUND", reg.registerId);
+      await concord.createAction("FUND", { type: "split", recordTime: at(5), num: "2", den: "1" });
+    });
+
+    it("positions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "positions");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("runId,asOf,address,holderIds,chainUnits,registerUnits,difference,chainStatus,registerStatus,matched");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain(h1);
+      expect(firstRow).toContain("90");
+    });
+
+    it("runs section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "runs");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe(
+        "id,asOf,createdAt,registerId,status,chainLedger,chainSyncedAt,chainBehind,chainSupply,registerTotal,supplyDifference,chainHolders,registerHolders,lines,matchedLines,breakCount,openBreaks",
+      );
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("breaks");
+      expect(firstRow).toContain("90");
+    });
+
+    it("actions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "actions");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("id,type,label,recordTime,state,createdAt,reconciledAt,openBreaks");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("split");
+    });
+
+    it("journal section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "journal");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("ref,date,type,from_account,to_account,units,tx_hash");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("J1");
+      expect(firstRow).toContain("100");
+    });
+
+    it("instructions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "instructions");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("ref,type,account,units,issued_at,approved_by,reason");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("I1");
+      expect(firstRow).toContain("authorize");
+    });
+
+    it("invalid-section message lists all allowed sections", () => {
+      const expectedSections = [
+        "holdings",
+        "events",
+        "controls",
+        "breaks",
+        "positions",
+        "runs",
+        "actions",
+        "journal",
+        "instructions",
+      ];
+      let thrown: Error | undefined;
+      try {
+        concord.exportCsv("FUND", "invalid-section");
+      } catch (err) {
+        thrown = err as Error;
+      }
+      expect(thrown).toBeInstanceOf(Invalid);
+      for (const section of expectedSections) {
+        expect(thrown!.message).toContain(section);
+      }
+      expect(thrown!.message).toBe(
+        "section must be holdings, events, controls, breaks, positions, runs, actions, journal or instructions",
+      );
+    });
+  });
+
   it("includes register provenance in the audit pack covering every reconciled register", async () => {
     await concord.sync("FUND");
     const reg1 = concord.importRegister(
