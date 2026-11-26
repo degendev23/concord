@@ -9,7 +9,7 @@ import { readFileSync as readFixture } from "node:fs";
 import { Address, Asset, StrKey, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { Auth } from "../src/auth.js";
 import { runCli } from "../src/cli.js";
-import { StellarSource } from "../src/chain.js";
+import { StellarSource, ChainError } from "../src/chain.js";
 import { Concord } from "../src/concord.js";
 import { loadConfig } from "../src/config.js";
 import { Db } from "../src/db.js";
@@ -28,6 +28,12 @@ const ORG_MIGRATION_DIGESTS = [
   "ece8f3334de957d19e76585727af4790c2f6ba78f60407ade9a67e1edb25cd55",
   "d440cffcfb710a703cdb8c0b02c4704aeaf366b2c254ffd5e7789e25898f6174",
   "b7413e3d4eee55f419c70db885e1866b95c8c1a2b7d7f68eea4e44ecac93e611",
+  "a4ad7e98aa4e92355d44afc19bae0ab7a8ea76063398f5f4f56eadc7b7690073",
+  "41bc0d0c1c9a8c84109f284734b7f2892ddf93606c878a7fe4985355344bc6b2",
+  "0182ab60eee2caac4eaf616ae083065f7e05b8e2d68980514545950eb56cd80f",
+  "598b1578ce4051f043832d5b91d0df06043afb64e1c6a0fad190a2a733174155",
+  "c4f44d594aab43a45f28af28cd2085455394f0eb77e0bea99bc19aa0456d8b0f",
+  "269164d28b84cd2d70564ca514e63c810698cb87363163119a5c9dabea296a6f",
   "bfad9e965fbd1e940f1a21f1f4834b7e8601bf0a891bb945cec734c3f642b994",
 ];
 const CONTROL_MIGRATION_DIGESTS = ["ba25bc5419cfcc376d2e7ff027845b2da4b789d9c7e966424b70cdfbbb90a422"];
@@ -95,6 +101,10 @@ function probes(s: Seeded): Record<string, Probe> {
     "DELETE /api/org/members/:userId": p("DELETE", `/api/org/members/${s.a.userId}`),
     "PATCH /api/org": p("PATCH", "/api/org", { name: "Beta Partners" }),
     "DELETE /api/org": p("DELETE", "/api/org", { confirm: "Alpha Capital" }),
+    "GET /api/org/webhook": p("GET", "/api/org/webhook"),
+    "GET /api/org/settings": p("GET", "/api/org/settings"),
+    "PATCH /api/org/settings": p("PATCH", "/api/org/settings", { requireSecondSigner: true }),
+    "PUT /api/org/webhook": p("PUT", "/api/org/webhook", { url: "https://hooks.example.com/concord" }),
     "GET /api/overview": p("GET", "/api/overview"),
     "GET /api/lookup": p("GET", "/api/lookup?network=testnet&code=FUND"),
     "POST /api/assets": p("POST", "/api/assets", { network: "testnet", asset: "not an asset" }),
@@ -111,6 +121,8 @@ function probes(s: Seeded): Record<string, Probe> {
     "DELETE /api/assets/:id/registers/:registerId": p("DELETE", `/api/assets/${id}/registers/${s.registerId}`),
     "POST /api/assets/:id/journal": p("POST", `/api/assets/${id}/journal`, { csv: "ref,date,type,units\n" }),
     "POST /api/assets/:id/instructions": p("POST", `/api/assets/${id}/instructions`, { csv: "ref,type,account,issued_at\n" }),
+    "DELETE /api/assets/:id/journal/:entryRef": p("DELETE", `/api/assets/${id}/journal/J-ALPHA`),
+    "DELETE /api/assets/:id/instructions/:instructionRef": p("DELETE", `/api/assets/${id}/instructions/I-ALPHA`),
     "GET /api/assets/:id/reconciliations": p("GET", `/api/assets/${id}/reconciliations`),
     "POST /api/assets/:id/reconciliations": p("POST", `/api/assets/${id}/reconciliations`, { registerId: s.registerId }),
     "GET /api/reconciliations/:id": p("GET", `/api/reconciliations/${s.runId}`),
@@ -118,10 +130,14 @@ function probes(s: Seeded): Record<string, Probe> {
     "GET /api/assets/:id/actions": p("GET", `/api/assets/${id}/actions`),
     "POST /api/assets/:id/actions": p("POST", `/api/assets/${id}/actions`, { type: "split", recordTime: at(1), num: "2", den: "1" }),
     "GET /api/actions/:id": p("GET", `/api/actions/${s.actionId}`),
+    "DELETE /api/actions/:id": p("DELETE", `/api/actions/${s.actionId}`),
     "POST /api/actions/:id/reconcile": p("POST", `/api/actions/${s.actionId}/reconcile`),
+    "POST /api/actions/:id/void": p("POST", `/api/actions/${s.actionId}/void`, { reason: "tenancy probe" }),
     "GET /api/assets/:id/controls": p("GET", `/api/assets/${id}/controls`),
     "PUT /api/assets/:id/notes": p("PUT", `/api/assets/${id}/notes`, { scope: "recon", key: "k", fingerprint: "f", status: "resolved", note: "n" }),
     "GET /api/assets/:id/notes/history": p("GET", `/api/assets/${id}/notes/history`),
+    "PUT /api/assets/:id/notes/assignee": p("PUT", `/api/assets/${id}/notes/assignee`, { scope: "recon", key: "k", assigneeId: s.a.userId }),
+    "GET /api/assets/:id/breaks": p("GET", `/api/assets/${id}/breaks`),
     "GET /api/assets/:id/export": p("GET", `/api/assets/${id}/export`),
   };
 }
@@ -178,6 +194,8 @@ describe("workspace isolation", () => {
     const members = await s.a.json<{ members: Array<{ email: string; role: string }> }>("/api/org/members");
     expect(members.members).toEqual([expect.objectContaining({ email: "ann@alpha.test", role: "owner" })]);
     expect((await s.a.json<{ name: string }>(`/api/assets/${s.assetId}`)).name).toBe("FUND");
+    // B's DELETE probe on A's action id must leave A's action in place.
+    expect((await s.a.call(`/api/actions/${s.actionId}`)).status).toBe(200);
   });
 
   it("turns away every workspace route without a session", async () => {
@@ -1139,14 +1157,98 @@ describe("networks", () => {
       expect(loadConfig({ CONCORD_MAINNET_RPC_URLS: input }).networks.mainnet.rpc.map((e) => e.url)).toEqual(expected);
     }
   });
+
+  it.each([
+    ["PORT 0", { PORT: "0" }, { error: "PORT must be a whole number from 1 to 65535" }],
+    ["PORT -1", { PORT: "-1" }, { error: "PORT must be a whole number from 1 to 65535" }],
+    ["PORT 1.5", { PORT: "1.5" }, { error: "PORT must be a whole number from 1 to 65535" }],
+    ["PORT abc", { PORT: "abc" }, { error: "PORT must be a whole number from 1 to 65535" }],
+    ["PORT 70000 expecting PORT message after CON-0315", { PORT: "70000" }, { error: "PORT must be a whole number from 1 to 65535" }],
+    ["sync interval 0 accepted", { CONCORD_SYNC_INTERVAL: "0" }, { value: { syncIntervalSec: 0 } }],
+    ["sync interval -1 rejected by name", { CONCORD_SYNC_INTERVAL: "-1" }, { error: "CONCORD_SYNC_INTERVAL must be a whole number of at least 0" }],
+    ["sync interval 0.5 rejected by name", { CONCORD_SYNC_INTERVAL: "0.5" }, { error: "CONCORD_SYNC_INTERVAL must be a whole number of at least 0" }],
+    ["CONCORD_PORT beats PORT", { CONCORD_PORT: "5500", PORT: "6600" }, { value: { port: 5500 } }],
+    ["bad CONCORD_PORT names itself", { CONCORD_PORT: "bad", PORT: "6600" }, { error: "CONCORD_PORT must be a whole number from 1 to 65535" }],
+    ["empty strings count as unset", { PORT: "", CONCORD_PORT: "", CONCORD_SYNC_INTERVAL: "", CONCORD_TRUST_PROXY: "", CONCORD_EPHEMERAL: "" }, { value: { port: 4400, syncIntervalSec: 30, trustProxyHops: 0, ephemeral: false } }],
+    ["ephemeral 1 is true", { CONCORD_EPHEMERAL: "1" }, { value: { ephemeral: true } }],
+    ["ephemeral true is true", { CONCORD_EPHEMERAL: "true" }, { value: { ephemeral: true } }],
+    ["ephemeral yes is true after CON-0317", { CONCORD_EPHEMERAL: "yes" }, { value: { ephemeral: true } }],
+  ])("parses integer and boolean settings: %s", (_name, env, outcome) => {
+    if ("error" in outcome) {
+      expect(() => loadConfig(env)).toThrow(outcome.error);
+    } else {
+      expect(loadConfig(env)).toMatchObject(outcome.value);
+    }
+  });
+
+  it.each([
+    [
+      "host matching a.example",
+      JSON.stringify({ "a.example": { "x-api-key": "a" } }),
+      { headers: [{ "x-api-key": "a" }, undefined] },
+    ],
+    [
+      "host:port matching b.example:8443",
+      JSON.stringify({ "b.example:8443": { "x-api-key": "b-port" } }),
+      { headers: [undefined, { "x-api-key": "b-port" }] },
+    ],
+    [
+      "bare hostname fallback for ported URL b.example after CON-0319",
+      JSON.stringify({ "b.example": { "x-api-key": "b-bare" } }),
+      { headers: [undefined, { "x-api-key": "b-bare" }] },
+    ],
+    [
+      "exact host:port precedence over hostname",
+      JSON.stringify({ "b.example:8443": { "x-api-key": "exact" }, "b.example": { "x-api-key": "fallback" } }),
+      { headers: [undefined, { "x-api-key": "exact" }] },
+    ],
+    [
+      "null after CON-0318",
+      "null",
+      { error: 'CONCORD_RPC_HEADERS must be JSON: {"host": {"header": "value"}}' },
+    ],
+    [
+      "[] after CON-0318",
+      "[]",
+      { error: 'CONCORD_RPC_HEADERS must be JSON: {"host": {"header": "value"}}' },
+    ],
+    [
+      '{"a.example":"b"} after CON-0318',
+      '{"a.example":"b"}',
+      { error: 'CONCORD_RPC_HEADERS must be JSON: {"host": {"header": "value"}}' },
+    ],
+    [
+      '{"a.example":{"k":1}} after CON-0318',
+      '{"a.example":{"k":1}}',
+      { error: 'CONCORD_RPC_HEADERS must be JSON: {"host": {"header": "value"}}' },
+    ],
+    [
+      "invalid JSON verbatim message",
+      "{not-json}",
+      { error: 'CONCORD_RPC_HEADERS must be JSON: {"host": {"header": "value"}}' },
+    ],
+  ])("validates CONCORD_RPC_HEADERS and applies headers: %s", (_name, rpcHeaders, expected) => {
+    const env = {
+      CONCORD_MAINNET_RPC_URLS: "https://a.example, https://b.example:8443",
+      CONCORD_RPC_HEADERS: rpcHeaders,
+    };
+    if ("error" in expected) {
+      expect(() => loadConfig(env)).toThrow(expected.error);
+    } else {
+      const config = loadConfig(env);
+      const rpc = config.networks.mainnet.rpc;
+      expect(rpc[0]?.headers).toEqual(expected.headers[0]);
+      expect(rpc[1]?.headers).toEqual(expected.headers[1]);
+    }
+  });
 });
 
 describe("chain endpoints", () => {
-  const network = (urls: string[], headers?: Record<string, string>) => ({
+  const network = (urls: string[], headers?: Record<string, string>, horizon: string[] = ["https://horizon.example"]) => ({
     name: "mainnet" as const,
     passphrase: MAINNET_PASSPHRASE,
     rpc: urls.map((url) => ({ url, ...(headers ? { headers } : {}) })),
-    horizon: [{ url: "https://horizon.example" }],
+    horizon: horizon.map((url) => ({ url })),
   });
   const health = () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { latestLedger: 50, oldestLedger: 10, oldestLedgerCloseTime: "1790000000" } }));
 
@@ -1439,6 +1541,37 @@ describe("chain endpoints", () => {
     await expect(new StellarSource(network(["https://rpc.example"]), lagging.deps).baseline("FUND", issuer, 7)).rejects.toThrow(/back in time/);
   });
 
+  it("baseline() starts over on the next Horizon when the first fails mid-read, keeping none of its pages", async () => {
+    const issuer = key();
+    const [h1, h3] = [key(), key()];
+    const record = (id: string, balance: string) => ({
+      account_id: id,
+      balances: [{ asset_code: "FUND", asset_issuer: issuer, balance, is_authorized: true }],
+    });
+    const many = Array.from({ length: 199 }, () => record(key(), "1.0000000"));
+    const [a, b] = ["https://horizon-a.example", "https://horizon-b.example"];
+    const query = `/accounts?asset=FUND%3A${issuer}&limit=200&order=asc`;
+    const aPage2 = `${a}/accounts?cursor=abc&limit=200`;
+    const page = (records: unknown[], ledger: number, next?: string) => () =>
+      new Response(JSON.stringify({ _links: next ? { next: { href: next } } : {}, _embedded: { records } }), {
+        headers: { "latest-ledger": String(ledger) },
+      });
+    const { calls, deps } = scripted({
+      [`${a}${query}`]: [page([record(h1, "70.0000000"), ...many], 150, aPage2)],
+      [aPage2]: [() => new Response("slow down", { status: 429 })],
+      [`${b}${query}`]: [page([record(h3, "12.0000000")], 160)],
+    });
+    const source = new StellarSource(network(["https://rpc.example"], undefined, [a, b]), deps);
+    const baseline = await source.baseline("FUND", issuer, 7);
+
+    // A's first page is discarded with the failed read; only B's page makes up the result.
+    expect(calls.map((c) => c.url)).toEqual([`${a}${query}`, aPage2, `${b}${query}`]);
+    expect(baseline.ledger).toBe(160);
+    expect(baseline.openings.size).toBe(1);
+    expect(baseline.openings.get(h3)).toEqual({ amount: u(12), asOfLedger: 160, authorized: true });
+    expect(baseline.openings.has(h1)).toBe(false);
+  });
+
   it.each([
     {
       scenario: "503, 503, 200 on page 2",
@@ -1624,6 +1757,143 @@ describe("chain endpoints", () => {
     expect(fullBaseline.ledger).toBe(99);
     expect(fullBaseline.openings.size).toBe(200);
     expect(singleFull.calls.map((c) => c.url)).toEqual([`https://horizon.example${firstPath}`]);
+  });
+
+  it("baseline() skips records without the asset line, leaves authorized undefined when missing, and overwrites duplicate accounts across pages", async () => {
+    const issuer = key();
+    const otherIssuer = key();
+    const wrongIssuerAcc = key();
+    const missingAuthAcc = key();
+    const unauthAcc = key();
+    const zeroBalanceAcc = key();
+    const normalAcc = key();
+
+    const cases = [
+      {
+        name: "wrong issuer is skipped",
+        record: {
+          account_id: wrongIssuerAcc,
+          balances: [{ asset_code: "FUND", asset_issuer: otherIssuer, balance: "10.0000000", is_authorized: true }],
+        },
+        expectedOpening: undefined,
+      },
+      {
+        name: "missing is_authorized leaves authorized undefined/absent",
+        record: {
+          account_id: missingAuthAcc,
+          balances: [{ asset_code: "FUND", asset_issuer: issuer, balance: "25.0000000" }],
+        },
+        expectedOpening: { amount: 250_000_000n, asOfLedger: 150 },
+      },
+      {
+        name: "is_authorized false is kept",
+        record: {
+          account_id: unauthAcc,
+          balances: [{ asset_code: "FUND", asset_issuer: issuer, balance: "5.0000000", is_authorized: false }],
+        },
+        expectedOpening: { amount: 50_000_000n, asOfLedger: 150, authorized: false },
+      },
+      {
+        name: "zero balance is kept as 0n",
+        record: {
+          account_id: zeroBalanceAcc,
+          balances: [{ asset_code: "FUND", asset_issuer: issuer, balance: "0.0000000", is_authorized: true }],
+        },
+        expectedOpening: { amount: 0n, asOfLedger: 150, authorized: true },
+      },
+      {
+        name: "authorized record is kept",
+        record: {
+          account_id: normalAcc,
+          balances: [{ asset_code: "FUND", asset_issuer: issuer, balance: "100.0000000", is_authorized: true }],
+        },
+        expectedOpening: { amount: 1_000_000_000n, asOfLedger: 150, authorized: true },
+      },
+    ];
+
+    const expectedMap = new Map<string, { amount: bigint; asOfLedger: number; authorized?: boolean }>();
+    for (const c of cases) {
+      if (c.expectedOpening) {
+        expectedMap.set(c.record.account_id, c.expectedOpening);
+      }
+    }
+
+    const first = `https://horizon.example/accounts?asset=FUND%3A${issuer}&limit=200&order=asc`;
+    const singlePage = scripted({
+      [first]: [
+        () =>
+          new Response(
+            JSON.stringify({
+              _links: {},
+              _embedded: { records: cases.map((c) => c.record) },
+            }),
+            { headers: { "latest-ledger": "150" } },
+          ),
+      ],
+    });
+
+    const source = new StellarSource(network(["https://rpc.example"]), singlePage.deps);
+    const baseline = await source.baseline("FUND", issuer, 7);
+
+    expect(baseline.ledger).toBe(150);
+    // Deep-equals the resulting Opening map
+    expect(baseline.openings).toEqual(expectedMap);
+    expect(baseline.openings).toStrictEqual(expectedMap);
+
+    // Explicitly verify acceptance criteria
+    expect(baseline.openings.has(wrongIssuerAcc)).toBe(false);
+    expect("authorized" in baseline.openings.get(missingAuthAcc)!).toBe(false);
+    expect(baseline.openings.get(missingAuthAcc)!.authorized).toBeUndefined();
+    expect(baseline.openings.get(unauthAcc)!.authorized).toBe(false);
+    expect(baseline.openings.get(zeroBalanceAcc)!.amount).toBe(0n);
+
+    // Two-page variant for the duplicate account (200 records on page 1 so the next link is followed)
+    const dupAccount = key();
+    const line = (balance: string, authorized = true) => ({
+      asset_code: "FUND",
+      asset_issuer: issuer,
+      balance,
+      is_authorized: authorized,
+    });
+    const record = (id: string, balance: string, authorized = true) => ({
+      account_id: id,
+      balances: [line(balance, authorized)],
+    });
+    const many = Array.from({ length: 199 }, () => record(key(), "1.0000000"));
+    const second = "https://horizon.example/accounts?cursor=page2&limit=200";
+
+    const twoPage = scripted({
+      [first]: [
+        () =>
+          new Response(
+            JSON.stringify({
+              _links: { next: { href: second } },
+              _embedded: { records: [record(dupAccount, "10.0000000", true), ...many] },
+            }),
+            { headers: { "latest-ledger": "150" } },
+          ),
+      ],
+      [second]: [
+        () =>
+          new Response(
+            JSON.stringify({
+              _links: {},
+              _embedded: { records: [record(dupAccount, "99.0000000", false)] },
+            }),
+            { headers: { "latest-ledger": "155" } },
+          ),
+      ],
+    });
+
+    const sourceTwoPage = new StellarSource(network(["https://rpc.example"]), twoPage.deps);
+    const resTwoPage = await sourceTwoPage.baseline("FUND", issuer, 7);
+    expect(resTwoPage.ledger).toBe(150);
+    expect(resTwoPage.openings.size).toBe(200); // 199 other accounts + 1 duplicate overwritten
+    expect(resTwoPage.openings.get(dupAccount)).toEqual({
+      amount: 990_000_000n,
+      asOfLedger: 155,
+      authorized: false,
+    });
   });
 
   it("finds classic assets by code, most widely held first", async () => {
@@ -1998,6 +2268,143 @@ describe("chain endpoints", () => {
       method: "getLedgerEntries",
       params: { keys: [expectedKey] },
     });
+  });
+
+  it.each([
+    [
+      "string-typed latestLedger",
+      { latestLedger: "10", oldestLedger: 1 },
+      { error: "Stellar RPC getHealth did not report its ledger range" },
+    ],
+    [
+      "missing oldestLedger",
+      { latestLedger: 10 },
+      { error: "Stellar RPC getHealth did not report its ledger range" },
+    ],
+    [
+      "null result",
+      null,
+      { error: "Stellar RPC getHealth returned no result" },
+    ],
+    [
+      "oldestLedgerCloseTime 'abc'",
+      { latestLedger: 10, oldestLedger: 1, oldestLedgerCloseTime: "abc" },
+      { head: { latest: 10, oldest: 1 } },
+    ],
+    [
+      "oldestLedgerCloseTime '0'",
+      { latestLedger: 10, oldestLedger: 1, oldestLedgerCloseTime: "0" },
+      { head: { latest: 10, oldest: 1 } },
+    ],
+  ])("handles %s from getHealth", async (_name, result, expected) => {
+    const url = "https://rpc.example";
+    const { deps } = scripted({
+      [url]: [() => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }))],
+    });
+    const source = new StellarSource(network([url]), deps);
+    if ("error" in expected) {
+      const err = await source.latestLedger().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ChainError);
+      expect((err as ChainError).kind).toBe("rejected");
+      expect((err as ChainError).message).toBe(expected.error);
+    } else {
+      expect(await source.latestLedger()).toEqual(expected.head);
+    }
+  });
+
+  it("retries an unreadable HTML response once, sleeping 250-500ms, and succeeds if next is valid", async () => {
+    const a = "https://a.example";
+    const { calls, sleeps, deps } = scripted({
+      [a]: [
+        () => new Response("<html><head><title>Sign in</title></head><body>Captive portal</body></html>", { status: 200, headers: { "content-type": "text/html" } }),
+        health,
+      ],
+    });
+    const source = new StellarSource(network([a]), deps);
+    const head = await source.latestLedger();
+    expect(head.latest).toBe(50);
+    expect(calls).toHaveLength(2);
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeGreaterThanOrEqual(250);
+    expect(sleeps[0]).toBeLessThanOrEqual(500);
+  });
+
+  it("retries an unreadable HTML response once and reports ChainError with unreadable response on second failure", async () => {
+    const a = "https://a.example";
+    const { calls, sleeps, deps } = scripted({
+      [a]: [
+        () => new Response("<html>502 Bad Gateway</html>", { status: 200 }),
+        () => new Response("<html>502 Bad Gateway</html>", { status: 200 }),
+      ],
+    });
+    const source = new StellarSource(network([a]), deps);
+    const err = await source.latestLedger().catch((e: Error) => e);
+    expect(err).toBeInstanceOf(ChainError);
+    expect(err).not.toBeInstanceOf(SyntaxError);
+    expect((err as ChainError).message).toContain("a.example: unreadable response");
+    expect(calls).toHaveLength(2);
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeGreaterThanOrEqual(250);
+    expect(sleeps[0]).toBeLessThanOrEqual(500);
+  });
+
+  it("retries an empty response body once and reports ChainError with unreadable response on second failure", async () => {
+    const a = "https://a.example";
+    const { calls, sleeps, deps } = scripted({
+      [a]: [
+        () => new Response("", { status: 200 }),
+        () => new Response("", { status: 200 }),
+      ],
+    });
+    const source = new StellarSource(network([a]), deps);
+    const err = await source.latestLedger().catch((e: Error) => e);
+    expect(err).toBeInstanceOf(ChainError);
+    expect(err).not.toBeInstanceOf(SyntaxError);
+    expect((err as ChainError).message).toContain("a.example: unreadable response");
+    expect(calls).toHaveLength(2);
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]).toBeGreaterThanOrEqual(250);
+    expect(sleeps[0]).toBeLessThanOrEqual(500);
+  });
+
+  it.each([
+    ["1.00000001"],
+    [""],
+    ["NaN"],
+  ])("surfaces malformed or over-precise Horizon balance %s as a typed ChainError naming the account", async (badBalance) => {
+    const issuer = key();
+    const accountId = key();
+    const h1 = "https://h1.example";
+    const h2 = "https://h2.example";
+    const record = {
+      account_id: accountId,
+      balances: [{ asset_code: "FUND", asset_issuer: issuer, balance: badBalance }],
+    };
+    const { calls, deps } = scripted({
+      [`${h1}/accounts?asset=FUND%3A${issuer}&limit=200&order=asc`]: [
+        () => new Response(JSON.stringify({ _embedded: { records: [record] } }), {
+          headers: { "latest-ledger": "100" },
+        }),
+      ],
+      [`${h2}/accounts?asset=FUND%3A${issuer}&limit=200&order=asc`]: [
+        () => new Response(JSON.stringify({ _embedded: { records: [] } }), {
+          headers: { "latest-ledger": "100" },
+        }),
+      ],
+    });
+    const net = {
+      name: "mainnet" as const,
+      passphrase: MAINNET_PASSPHRASE,
+      rpc: [{ url: "https://rpc.example" }],
+      horizon: [{ url: h1 }, { url: h2 }],
+    };
+    const source = new StellarSource(net, deps);
+    const err = await source.baseline("FUND", issuer, 7).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ChainError);
+    expect((err as ChainError).kind).toBe("rejected");
+    expect((err as Error).message).toContain(accountId.slice(0, 8));
+    expect((err as Error).message).toContain(`"${badBalance}"`);
+    expect(calls).toHaveLength(1);
   });
 });
 

@@ -34,6 +34,8 @@ value.
 | `CONCORD_TRUST_PROXY` | `0` | A whole number of proxy hops, 0 to 10 | Not a whole number, below 0, or above 10 |
 | `CONCORD_WEB_DIR` | `<repo>/apps/web/dist` | A directory holding the built dashboard. A relative path is resolved against the repository root, not the working directory | Not checked |
 | `CONCORD_DATA_DIR` | `<repo>/data` | A directory on a local disk. A relative path is resolved against the repository root, not the working directory | Not checked |
+| `CONCORD_SQLITE_SYNCHRONOUS` | `normal` | `normal` (fast writes; WAL keeps the database consistent, a power cut can lose the last commits) or `full` (syncs every commit) | Anything else, including an empty value |
+| `CONCORD_CHECK_ON_OPEN` | Off | As `CONCORD_EPHEMERAL`. On, each workspace database runs `PRAGMA quick_check` and `foreign_key_check` when it opens (the control database is always checked at startup) | As `CONCORD_EPHEMERAL` |
 | `CONCORD_EPHEMERAL` | Off | `1`, `true`, `yes` or `on` turns it on; `0`, `false`, `no` or `off` turns it off (case-insensitive) | Anything else |
 | `CONCORD_SIGNUP` | `open` | `open` or `code` | Anything else, including an empty value |
 | `CONCORD_MAX_ASSETS` | `10` | A whole number, 1 to 1000 | Not a whole number, below 1, or above 1000 |
@@ -51,6 +53,9 @@ value.
 | `CONCORD_RPC_HEADERS_FILE` | Unset | Path to a file holding the `CONCORD_RPC_HEADERS` JSON; one trailing newline is dropped | Set together with `CONCORD_RPC_HEADERS`, empty, the file cannot be read, or its contents fail the checks above |
 | `CONCORD_USER_AGENT_SUFFIX` | Unset (no suffix) | A contact string, at most 120 printable ASCII characters, e.g. an email address. Appended to the User-Agent on RPC and Horizon requests | Longer than 120 characters, or a character outside printable ASCII |
 | `CONCORD_SYNC_INTERVAL` | `30` | Seconds between indexer passes. `0` turns the indexer off | Not a whole number, or below 0 |
+| `CONCORD_SIGNING_KEY` | Unset (packs are not signed) | Path to an ed25519 private key in PEM format (relative to the repository root), or the PEM itself. Audit packs then carry `keyId` and `signature`; check them with `concord verify-pack FILE --key PUBLIC.pem` | Not an ed25519 private key, or the file cannot be read (reported when a pack is exported) |
+| `CONCORD_SYNC_CONCURRENCY` | `4` | Assets of one network the indexer works on at once. `1` walks them one after another | Not a whole number from 1 to 32 |
+| `CONCORD_SYNC_ASSET_BUDGET` | `60` | Seconds one asset may index in a pass before the rest of its backlog waits for the next pass. `0` means no limit | Not a whole number from 0 to 3600 |
 | `CONCORD_ORG` | None | A workspace id, or a workspace's exact name | When a command needs a workspace and the value matches none, or matches more than one by name |
 
 Whole numbers are parsed with `Number()`, so `" 5 "` is read as `5` and `5.5` is refused
@@ -143,6 +148,12 @@ An empty value (`NAME=`) does not always mean unset:
 - **`CONCORD_SYNC_INTERVAL`.** The seconds between background indexer passes. Only the server
   runs the indexer: it makes the first pass at start-up, and passes never overlap. `0` turns it
   off; `pnpm concord sync` still works.
+- **`CONCORD_SYNC_CONCURRENCY` and `CONCORD_SYNC_ASSET_BUDGET`.** Within a pass, each network's
+  assets are taken in order, up to `CONCORD_SYNC_CONCURRENCY` at a time, so one asset with a
+  long backlog does not hold the rest. An asset that is still paging through events after
+  `CONCORD_SYNC_ASSET_BUDGET` seconds saves its position and carries on in the next pass. A
+  concurrency of `1` with a budget of `0` is the old behaviour: one asset after another, each
+  to the tip. A sync started by hand is not bounded by the budget.
 
 ### Command line
 

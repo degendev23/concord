@@ -44,17 +44,28 @@ export interface Runtime {
 
 /** Identity records, the chain sources for both networks, and the workspaces over them. */
 export function openRuntime(config: Config): Runtime {
-  const control = new Db(join(config.dataDir, "control.db"), CONTROL_MIGRATIONS);
+  const control = new Db(join(config.dataDir, "control.db"), CONTROL_MIGRATIONS, config.sqliteSynchronous);
+  try {
+    control.check();
+  } catch (err) {
+    control.close();
+    throw err;
+  }
   const auth = new Auth(control, { signup: config.signup, maxInvites: config.maxInvitesPerOrg, ...(config.passwordCost ? { cost: config.passwordCost } : {}) });
   const networks: Networks = {};
   for (const name of NETWORK_NAMES) {
     networks[name] = { passphrase: config.networks[name].passphrase, chain: new StellarSource(config.networks[name]) };
   }
   const tenants = new Tenants(
-    fileStore(config.dataDir),
+    fileStore(config.dataDir, { synchronous: config.sqliteSynchronous, checkOnOpen: config.checkOnOpen }),
     networks,
     (orgId) => auth.orgExists(orgId),
     () => auth.orgIds(),
+    {
+      syncConcurrency: config.syncConcurrency,
+      syncAssetBudgetMs: config.syncAssetBudgetSec * 1000,
+      ...(config.signingKey ? { signingKey: config.signingKey } : {}),
+    },
   );
   return {
     control,
@@ -168,7 +179,7 @@ export function startIndexer(
         for (const r of await tenants.syncAll()) {
           const where = r.assetId ? `${r.orgId}/${r.assetId.slice(0, 8)}` : r.orgId;
           if (r.error) console.error(`sync ${where}: ${r.error}`);
-          else if (r.added) console.log(`sync ${where}: +${r.added} events`);
+          else if (r.added) console.log(`sync ${where}: +${r.added} events${r.more ? " (more next pass)" : ""}`);
         }
       } catch (err) {
         // Nothing here may take the process down; the next pass tries again.

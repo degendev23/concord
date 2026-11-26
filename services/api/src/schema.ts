@@ -174,7 +174,61 @@ ALTER TABLE assets ADD COLUMN movement_window_hours INTEGER NOT NULL DEFAULT 24;
 `,
   // v5: per-asset reconciliation tolerance (smallest units as TEXT to preserve bigint precision).
   `ALTER TABLE assets ADD COLUMN tolerance TEXT;`,
-  // v6: keep a change log of corporate action edits before snapshot.
+  // v6: holdings checkpoints, so a historical holdings(asOf) or a corporate-action snapshot replays
+  // only the events after the nearest earlier checkpoint. Derived data: Concord rebuilds any row
+  // it finds missing, so deleting them is always safe.
+  `
+CREATE TABLE holdings_checkpoints (
+  asset_id TEXT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+  ledger INTEGER NOT NULL,
+  closed_at TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (asset_id, ledger)
+);
+CREATE INDEX events_asset_ledger ON events (asset_id, ledger);
+`,
+  // v7: runs list columns (summary, status, chain_behind, open_breaks), backfilled from stored result bodies, so listing never parses them
+  `
+ALTER TABLE runs ADD COLUMN summary TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'clean';
+ALTER TABLE runs ADD COLUMN chain_behind INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN open_breaks INTEGER NOT NULL DEFAULT 0;
+UPDATE runs SET
+  summary = COALESCE(json_extract(result, '$.summary'), '{}'),
+  status = COALESCE(json_extract(result, '$.status'), 'clean'),
+  chain_behind = COALESCE(json_extract(result, '$.chainBehind'), 0),
+  open_breaks = (
+    SELECT COUNT(*) FROM json_each(runs.result, '$.breaks') b
+    WHERE NOT EXISTS (
+      SELECT 1 FROM break_notes n
+      WHERE n.asset_id = runs.asset_id AND n.scope = 'recon'
+        AND n.key = json_extract(b.value, '$.key')
+        AND n.fingerprint = json_extract(b.value, '$.fingerprint')
+        AND n.status <> 'open'
+    )
+  );
+`,
+  // v8: an action entered in error is voided rather than deleted, so it keeps its place in the audit trail
+  `
+ALTER TABLE actions ADD COLUMN voided_at TEXT;
+ALTER TABLE actions ADD COLUMN voided_by TEXT;
+ALTER TABLE actions ADD COLUMN void_reason TEXT;
+`,
+  // v9: a break can be owned by one workspace member; the label is stored beside the id so a payload still names the person after they leave
+  `
+ALTER TABLE break_notes ADD COLUMN assignee_id TEXT;
+ALTER TABLE break_notes ADD COLUMN assignee_label TEXT;
+`,
+  // v10: who imported a register, by user id, so the four-eyes rule can compare it with the person signing off
+  `
+ALTER TABLE registers ADD COLUMN imported_by_id TEXT;
+`,
+  // v11: a dividend's pay asset that nobody watches is watched automatically as a hidden, flow-only asset
+  `
+ALTER TABLE assets ADD COLUMN flow_only INTEGER NOT NULL DEFAULT 0;
+`,
+  // v12: keep a change log of corporate action edits before snapshot
   `
 CREATE TABLE action_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

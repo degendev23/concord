@@ -1,13 +1,14 @@
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
+import { stream } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { templateCsv } from "@concord/core";
 import { Auth, Conflict, Forbidden, Rejected, Unauthorized, type SessionInfo } from "./auth.js";
 import { authRoutes, clientIp, jsonBody, me, sessions, type ApiOptions } from "./auth-api.js";
 import { ChainError } from "./chain.js";
 import { isNetworkName } from "./config.js";
-import { Concord, Invalid, NotFound, type ActionInput, type Actor, type NoteInput } from "./concord.js";
+import { Concord, Invalid, NotFound, type ActionInput, type Actor, type HoldingsPage, type NoteInput } from "./concord.js";
 import { RateLimiter, TooMany } from "./security.js";
 import type { Tenants } from "./tenants.js";
 
@@ -19,6 +20,8 @@ const KB = 1024;
 
 /** Keeps a download's name to characters every browser and header parser accepts. */
 const fileSafe = (text: string) => text.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "asset";
+/** A whole number from a query string; anything else becomes NaN, which the caller rejects by name. */
+const queryInt = (value: string) => (/^-?\d+$/.test(value) ? Number(value) : Number.NaN);
 
 export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Hono {
   const app = new Hono();
@@ -164,6 +167,18 @@ export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Ho
     auth.renameOrg(c.var.session.org.id, input.name);
     return c.json(me(auth, cookies.read(c)!));
   });
+
+  // Outbound alerts: an https endpoint receives a signed POST when a run or a sync needs
+  // attention. Private and loopback targets are refused, and only an owner may see or set it.
+  priv.get("/org/webhook", (c) => {
+    owner(c);
+    return c.json(c.var.ws.webhookSettings());
+  });
+  priv.put("/org/webhook", async (c) => {
+    owner(c);
+    const input = await jsonBody<{ url?: unknown }>(c);
+    return c.json(c.var.ws.setWebhook(input.url ?? "", options.publicUrl));
+  });
   priv.delete("/org", async (c) => {
     owner(c);
     const { session } = c.var;
@@ -173,6 +188,13 @@ export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Ho
     tenants.drop(session.org.id);
     cookies.end(c);
     return c.json({ ok: true });
+  });
+
+  priv.get("/org/settings", (c) => c.json(c.var.ws.settings()));
+  priv.patch("/org/settings", async (c) => {
+    owner(c);
+    const input = await jsonBody<{ requireSecondSigner?: boolean }>(c);
+    return c.json(c.var.ws.updateSettings(input));
   });
 
   // ── assets ────────────────────────────────────────────────────────────────
@@ -242,7 +264,18 @@ export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Ho
     return c.json(ws.assetSummary(await ws.rebuild(id(c), { defer: true })));
   });
 
-  priv.get("/assets/:id/holdings", (c) => c.json(c.var.ws.holdings(id(c), c.req.query("asOf"))));
+  priv.get("/assets/:id/holdings", (c) => {
+    const { asOf, limit, offset, after, q, sort } = c.req.query();
+    // Any paging parameter asks for one page; with none the full list comes back as before.
+    const paged = [limit, offset, after, q, sort].some((v) => v !== undefined);
+    const page: HoldingsPage = {};
+    if (limit !== undefined) page.limit = queryInt(limit);
+    if (offset !== undefined) page.offset = queryInt(offset);
+    if (after !== undefined) page.after = after;
+    if (q !== undefined) page.q = q;
+    if (sort !== undefined) page.sort = sort as HoldingsPage["sort"];
+    return c.json(c.var.ws.holdings(id(c), asOf, paged ? page : undefined));
+  });
   priv.get("/assets/:id/events", (c) => {
     const filter: { kind?: string; address?: string; limit?: number; before?: string } = {};
     const { kind, address, limit, before } = c.req.query();
@@ -289,10 +322,18 @@ export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Ho
     if (typeof input.csv !== "string") throw new Invalid("csv is required");
     return c.json(c.var.ws.importJournal(id(c), input.csv, { mode: input.mode, allowPartial: input.allowPartial }), 201);
   });
+  priv.delete("/assets/:id/journal/:entryRef", (c) => {
+    c.var.ws.deleteJournalEntry(id(c), c.req.param("entryRef"));
+    return c.json({ ok: true });
+  });
   priv.post("/assets/:id/instructions", async (c) => {
     const input = await jsonBody<{ csv: string; mode?: "merge" | "replace" }>(c);
     if (typeof input.csv !== "string") throw new Invalid("csv is required");
     return c.json(c.var.ws.importInstructions(id(c), input.csv, { ...(input.mode !== undefined ? { mode: input.mode } : {}) }), 201);
+  });
+  priv.delete("/assets/:id/instructions/:instructionRef", (c) => {
+    c.var.ws.deleteInstruction(id(c), c.req.param("instructionRef"));
+    return c.json({ ok: true });
   });
 
   // ── reconciliation ────────────────────────────────────────────────────────
@@ -320,9 +361,23 @@ export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Ho
     return c.json(await c.var.ws.createAction(id(c), await jsonBody<ActionInput>(c), c.var.actor), 201);
   });
   priv.get("/actions/:id", (c) => c.json(c.var.ws.action(numeric(c, "id"))));
+  priv.delete("/actions/:id", async (c) => {
+    await c.var.ws.deleteAction(numeric(c, "id"));
+    return c.json({ ok: true });
+  });
   priv.post("/actions/:id/reconcile", async (c) => {
     throttle(c, "reconcile", 20, 10 * 60_000);
     return c.json(await c.var.ws.reconcileAction(numeric(c, "id")));
+  });
+  priv.post("/actions/:id/void", async (c) => {
+    throttle(c, "reconcile", 20, 10 * 60_000);
+    const { ws, actor } = c.var;
+    const id = numeric(c, "id");
+    const input = await jsonBody<{ reason: unknown }>(c);
+    if (typeof input.reason !== "string" || !input.reason.trim()) {
+      throw new Invalid("a reason is required to void a corporate action");
+    }
+    return c.json(await ws.voidAction(id, input.reason.trim(), actor), 200);
   });
 
   priv.get("/assets/:id/controls", (c) => c.json(c.var.ws.controls(id(c))));
@@ -337,6 +392,28 @@ export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Ho
     return c.json(c.var.ws.setNote(id(c), input.scope, input.key, note, c.var.actor));
   });
 
+  // Current breaks from every scope, with their sign-off and owner. `assignee` takes a member id,
+  // or "none" for the breaks nobody owns.
+  priv.get("/assets/:id/breaks", (c) => c.json(c.var.ws.breaks(id(c), c.req.query("assignee") || undefined)));
+
+  priv.put("/assets/:id/notes/assignee", async (c) => {
+    const { ws, session } = c.var;
+    // Resolve the asset first: another workspace's id is a 404, never a hint about its members.
+    const asset = ws.asset(id(c));
+    const input = await jsonBody<{ scope: string; key: string; assigneeId?: string | null }>(c);
+    if (!input.scope || typeof input.key !== "string" || !input.key) throw new Invalid("scope and key are required");
+    // The assignee is a member of this workspace or nobody: the route never trusts a label or a
+    // user from elsewhere, and null clears the assignment.
+    let assignee: Actor | null = null;
+    if (input.assigneeId !== undefined && input.assigneeId !== null) {
+      const member =
+        typeof input.assigneeId === "string" ? auth.members(session.org.id).find((m) => m.id === input.assigneeId) : undefined;
+      if (!member) throw new Invalid("assignee must be a member of this workspace");
+      assignee = { id: member.id, label: `${member.name} <${member.email}>` };
+    }
+    return c.json(ws.assignBreak(asset.id, input.scope, input.key, assignee));
+  });
+
   priv.get("/assets/:id/notes/history", (c) => {
     return c.json(c.var.ws.noteHistory(id(c), c.req.query("scope") || undefined, c.req.query("key") || undefined));
   });
@@ -347,6 +424,31 @@ export function createApi(tenants: Tenants, auth: Auth, options: ApiOptions): Ho
     const section = c.req.query("section");
     const name = `concord-${fileSafe(asset.code)}`;
     const stamp = new Date().toISOString().slice(0, 10);
+    if (section === "events") {
+      const formatParam = c.req.query("format");
+      if (formatParam && formatParam !== "csv" && formatParam !== "ndjson") {
+        throw new Invalid("format must be csv or ndjson");
+      }
+      const format = formatParam === "ndjson" ? "ndjson" : "csv";
+      const ext = format === "ndjson" ? "ndjson" : "csv";
+      const mime = format === "ndjson" ? "application/x-ndjson; charset=utf-8" : "text/csv; charset=utf-8";
+      const p = period(c);
+      c.header("content-type", mime);
+      c.header("content-disposition", `attachment; filename="${name}-${fileSafe(section)}-${stamp}.${ext}"`);
+      return stream(
+        c,
+        async (s) => {
+          for (const chunk of ws.exportEvents(asset.id, p, format)) {
+            if (s.aborted) break;
+            await s.write(chunk);
+          }
+        },
+        async (err, s) => {
+          console.error(`Events export stream error for ${asset.id}:`, err);
+          s.abort();
+        },
+      );
+    }
     if (section) {
       const actionIdParam = c.req.query("id");
       const opts: { from?: string; to?: string; id?: number } = period(c);

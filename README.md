@@ -22,7 +22,7 @@ sleeps (after about fifteen idle minutes), and it can take a minute to wake. Do 
 in it. [`docs/deploy/render.md`](./docs/deploy/render.md) covers rebuilding the practice workspace.
 
 What it does, what it flags, why now and who it is for: [`docs/overview.md`](./docs/overview.md).
-What it deliberately does not do: [`docs/limits.md`](./docs/limits.md); opening balances and per-holder cutoffs: [`docs/baselines.md`](./docs/baselines.md).
+What it deliberately does not do: [`docs/limits.md`](./docs/limits.md); opening balances and per-holder cutoffs: [`docs/baselines.md`](./docs/baselines.md); measured scale limits up to 1M events: [`docs/capacity.md`](./docs/capacity.md).
 
 ## Run it
 
@@ -59,7 +59,7 @@ needs a code from `pnpm concord signup-code`; see the [operator guide](./docs/op
 
 ## Command line
 
-Everything on the dashboard except sign-off and team management is also on the command line. It
+Everything on the dashboard except team management is also on the command line. It
 works on the same data directory as the server, and may run while the server does.
 
 ```sh
@@ -68,6 +68,7 @@ export CONCORD_ORG="Harbourline Transfer"     # or pass --org to each command
 pnpm concord watch FUND:GISSUER... --name "Example Fund" --ignore GTREASURY...
 pnpm concord register FUND ./register.csv --as-of 2026-10-06T21:00:00Z
 pnpm concord action FUND split --record 2026-10-01T21:00:00Z --ratio 2:1
+pnpm concord reconcile-all --fail-on-breaks
 pnpm concord export FUND --out audit.json
 pnpm concord --help
 ```
@@ -126,6 +127,8 @@ Architecture decisions: [`docs/adr/`](./docs/adr/README.md).
 - [`docs/limits.md`](./docs/limits.md): the deliberate limits (fractions of the smallest unit in splits drop unless cash in lieu is configured); [`docs/ROADMAP.md`](./docs/ROADMAP.md)
   says which are next to fall.
 - [`docs/baselines.md`](./docs/baselines.md): opening balances (baselines), Horizon paging, per-holder cutoffs, and blind spots.
+- [`docs/troubleshooting-indexing.md`](./docs/troubleshooting-indexing.md): troubleshooting guide for indexing and chain errors.
+- **Scale**: [`docs/capacity.md`](./docs/capacity.md) documents measured limits up to 1,000,000 events (~1.2s replay time, ~640 MB RSS, ~322 MB SQLite footprint per million events), with reproducible benchmark script.
 - [`docs/prior-art.md`](./docs/prior-art.md): the prior-art check against the brief's first kill
   criterion (someone already ships this for Stellar): dated sources, kill criteria, re-check schedule.
 - [`docs/demo-testnet.md`](./docs/demo-testnet.md): `pnpm demo:testnet` issues a practice asset on
